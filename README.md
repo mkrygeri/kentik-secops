@@ -1,16 +1,27 @@
 # kentik-secops
 
-> Sync [Kentik](https://www.kentik.com) network alerts into [Google Chronicle SecOps](https://cloud.google.com/chronicle) as UDM events.
+> Sync [Kentik](https://www.kentik.com) network observability data into [Google Chronicle SecOps](https://cloud.google.com/chronicle) — alerts, BGP events, audit logs, and device inventory.
 
 ---
 
 ## Overview
 
-`kentik_to_chronicle.py` bridges the **Kentik Alerting API** and the **Google Chronicle SecOps Ingestion API**. It:
+This repository contains four integration scripts that bridge the **Kentik Network Observability Platform** and the **Google Chronicle SecOps Ingestion API**:
 
-1. Polls Kentik for active or historical network alerts via the [Kentik Alerting API](https://kb.kentik.com/docs/alerting) (`v202505`)
-2. Converts each alert to a [Chronicle Unified Data Model (UDM)](https://cloud.google.com/chronicle/docs/reference/udm-field-list) event
-3. Ingests the UDM events into Chronicle for detection, investigation, and case management
+| Script | Data source | Chronicle API | UDM type |
+|---|---|---|---|
+| `kentik_to_chronicle.py` | Alerting API | `ingest_udm` | `NETWORK_CONNECTION` / `GENERIC_EVENT` |
+| `bgp_to_chronicle.py` | BGP Monitoring API | `ingest_udm` | `NETWORK_UNCATEGORIZED` |
+| `audit_to_chronicle.py` | Audit Log API | `ingest_udm` | `USER_RESOURCE_ACCESS` |
+| `inventory_to_chronicle.py` | Device + Interface API | `import_entities` | ASSET entities |
+
+Each script is independent and can be deployed on its own schedule.
+
+---
+
+## Integration 1: Alerts (`kentik_to_chronicle.py`)
+
+Polls the Kentik Alerting API for active or historical network alerts, converts them to Chronicle UDM events, and ingests them for detection, investigation, and case management.
 
 ### Alert → UDM mapping
 
@@ -28,6 +39,197 @@
 | `flow.metricValues` | `additional.fields[flow_<name>]` |
 | `nms.device.name` | `additional.fields[nms_device_name]` |
 | All Kentik IDs & state | `additional.fields[kentik_*]` |
+
+---
+
+## Integration 2: BGP Monitoring (`bgp_to_chronicle.py`)
+
+Fetches BGP reachability and path-change metrics for all of your Kentik BGP monitors, converts them to `NETWORK_UNCATEGORIZED` UDM events, and ingests them into Chronicle.  Optionally also ingests route snapshots carrying origin ASN, AS-path, nexthop, and RPKI validity status — surfacing potential BGP hijacking or route-leak events directly in Chronicle investigations.
+
+### BGP metric → UDM mapping
+
+| Kentik field | UDM field |
+|---|---|
+| `timestamp` | `metadata.event_timestamp` |
+| `nlri` (CIDR prefix) | `target.resource.name` + `additional.fields[bgp_prefix]` |
+| `metricType` | `metadata.product_event_type` (`BGP_REACHABILITY` / `BGP_PATH_CHANGES`) |
+| `value` (reachability %) | `security_result[].severity` — see table below |
+| Monitor name | `additional.fields[kentik_monitor_name]` |
+| Monitor ID | `additional.fields[kentik_monitor_id]` |
+
+### BGP route snapshot → UDM mapping
+
+| Kentik field | UDM field |
+|---|---|
+| `nlri` (CIDR prefix) | `target.resource.name` |
+| `nexthop` | `target.ip[]` |
+| `originAsn` | `network.asn` + `additional.fields[bgp_origin_asn]` |
+| `asPath` | `additional.fields[bgp_as_path]` |
+| `rpkiStatus = INVALID` | `security_result[].severity` = `HIGH` |
+| `rpkiStatus = NOT_FOUND` | `security_result[].severity` = `LOW` |
+
+### Reachability severity mapping
+
+| Reachability % (vs threshold) | Severity |
+|---|---|
+| < 50 % of threshold | `CRITICAL` |
+| 50–75 % of threshold | `HIGH` |
+| 75–100 % of threshold | `MEDIUM` |
+| ≥ threshold | `INFORMATIONAL` |
+
+Default threshold: 80 %. Override with `--reachability-threshold`.
+
+### BGP usage
+
+```bash
+source .env
+
+# Default: last 1 hour of metrics from all monitors
+python bgp_to_chronicle.py
+
+# Last 6 hours, including route snapshots
+python bgp_to_chronicle.py --hours 6 --include-routes
+
+# Alert when reachability drops below 95 %
+python bgp_to_chronicle.py --reachability-threshold 95
+
+# Incremental daemon (recommended)
+python bgp_to_chronicle.py --daemon --interval 300 \
+    --state-file /var/lib/kentik_bgp_state.json
+
+# Dry run
+python bgp_to_chronicle.py --dry-run --include-routes
+```
+
+### BGP options
+
+```
+--hours FLOAT               Look-back window (default: 1)
+--reachability-threshold    Reachability % threshold for MEDIUM severity (default: 80)
+--include-routes            Also ingest AS-path / RPKI route snapshots
+--state-file PATH           Persist last-synced timestamp for incremental runs
+--dry-run                   Print UDM JSON; skip ingestion
+--daemon                    Run continuously at --interval seconds
+--interval SECONDS          Poll interval for --daemon mode (default: 300)
+```
+
+---
+
+## Integration 3: Audit Logs (`audit_to_chronicle.py`)
+
+Fetches every Kentik API call recorded in the audit trail (user, IP address, HTTP method, API path, timestamp) and ingests them as `USER_RESOURCE_ACCESS` UDM events.  Use this to detect insider threats, credential compromise, or suspicious configuration changes — for example, someone deleting an alert policy outside business hours or from an unrecognised IP address.
+
+### Audit event → UDM mapping
+
+| Kentik field | UDM field |
+|---|---|
+| `id` | `metadata.id` |
+| `ctime` | `metadata.event_timestamp` |
+| `api_method` | `metadata.product_event_type` (`AUDIT_GET`, `AUDIT_POST`, …) |
+| `api_path` | `target.resource.name` |
+| `user_id` | `principal.user.userid` |
+| `ip_address` | `principal.ip[]` |
+| `authority` | `target.resource.attribute.labels[authority]` |
+
+### Audit severity mapping
+
+| Condition | Severity |
+|---|---|
+| `DELETE` on any path | `HIGH` |
+| `POST`/`PUT`/`PATCH` to sensitive path (alerts, devices, users …) | `MEDIUM` |
+| Any other write | `LOW` |
+| Read-only (`GET`) | `INFORMATIONAL` |
+
+### Audit usage
+
+```bash
+source .env
+
+# One-shot: all events from the last 24 hours
+python audit_to_chronicle.py
+
+# Only write operations (POST, PUT, PATCH, DELETE)
+python audit_to_chronicle.py --writes-only
+
+# Incremental daemon
+python audit_to_chronicle.py --daemon --interval 600 \
+    --state-file /var/lib/kentik_audit_state.json
+
+# Dry run
+python audit_to_chronicle.py --dry-run --writes-only
+```
+
+### Audit options
+
+```
+--hours FLOAT       Look-back window (default: 24)
+--writes-only       Only ingest write operations
+--batch-size INT    Events per Chronicle call (default: 200)
+--state-file PATH   Persist last-synced timestamp for incremental runs
+--dry-run           Print UDM JSON; skip ingestion
+--daemon            Run continuously at --interval seconds
+--interval SECONDS  Poll interval for --daemon mode (default: 600)
+```
+
+---
+
+## Integration 4: Device & Interface Inventory (`inventory_to_chronicle.py`)
+
+Imports the Kentik network device and interface inventory into Chronicle as **ASSET entities**.  Once imported, the Chronicle investigation UI can look up any IP address and display the matching Kentik-managed device — including its name, site, labels, interfaces, and BGP configuration — enriching any UDM event that touches that IP.
+
+Run this on a daily schedule (or use `--daemon --interval 86400`).
+
+### Device → Chronicle entity mapping
+
+| Kentik field | Chronicle entity field |
+|---|---|
+| `alias` / `name` | `entity.asset.hostname` |
+| `sending_ips`, `snmp_ip`, BGP IPs | `entity.asset.ip[]` |
+| `device_type`, `subtype`, `status` | `entity.labels[kentik_device_type …]` |
+| `site.site_name` | `entity.labels[site]` |
+| `bgp_neighbor_asn` | `entity.labels[bgp_neighbor_asn]` |
+| Kentik labels (list) | `entity.labels[label]` (multi-valued) |
+
+### Interface → Chronicle entity mapping
+
+| Kentik field | Chronicle entity field |
+|---|---|
+| `snmp_alias` / `interface_description` | `entity.asset.hostname` |
+| `interface_ip` | `entity.asset.ip[]` |
+| `connectivity_type`, `network_boundary`, `provider` | `entity.labels[…]` |
+| `device_id` | `entity.labels[kentik_device_id]` |
+
+### Inventory usage
+
+```bash
+source .env
+
+# Full sync of devices and interfaces
+python inventory_to_chronicle.py
+
+# Devices only
+python inventory_to_chronicle.py --devices-only
+
+# Tag all imported entities with 'prod'
+python inventory_to_chronicle.py --label prod
+
+# Daily daemon
+python inventory_to_chronicle.py --daemon --interval 86400
+
+# Dry run (prints entity JSON)
+python inventory_to_chronicle.py --dry-run
+```
+
+### Inventory options
+
+```
+--devices-only      Import device entities only; skip interfaces
+--label TAG         Extra label to attach to all entities (e.g. 'prod')
+--batch-size INT    Entities per Chronicle import call (default: 500)
+--dry-run           Print entity JSON; skip import
+--daemon            Run continuously at --interval seconds
+--interval SECONDS  Re-sync interval for --daemon mode (default: 86400)
+```
 
 ---
 
@@ -105,7 +307,7 @@ GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 
 ---
 
-## Usage
+## Usage (Alerts)
 
 ```bash
 source .env   # load credentials into the shell
@@ -130,7 +332,7 @@ python kentik_to_chronicle.py --daemon --interval 300 \
 python kentik_to_chronicle.py --dry-run --hours 2
 ```
 
-### All options
+### All options (Alerts)
 
 ```
 usage: kentik_to_chronicle.py [-h] [--hours HOURS]
@@ -196,7 +398,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip install git+https://github.com/kentik/kentik-pyapi.git
-COPY kentik_to_chronicle.py .
+COPY kentik_to_chronicle.py bgp_to_chronicle.py \
+     audit_to_chronicle.py inventory_to_chronicle.py ./
+# Default: run the alerts sync in daemon mode
 CMD ["python", "kentik_to_chronicle.py", "--daemon", "--interval", "300", \
      "--state-file", "/data/state.json"]
 ```
@@ -229,26 +433,28 @@ pytest tests/
 ## How it works
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    kentik_to_chronicle.py                │
-│                                                          │
-│  ┌─────────────┐      ┌──────────────┐      ┌─────────┐ │
-│  │ KentikClient│─────▶│ alert_to_udm │─────▶│Chronicle│ │
-│  │ (kentik-api)│      │  converter   │      │  SDK    │ │
-│  └─────────────┘      └──────────────┘      └─────────┘ │
-│         │                                        │       │
-│         │  GET /v202505/alerts                   │       │
-│         │  (paginated, with filters)             │       │
-│         │                                        │       │
-│         │                           ingest_udm() │       │
-│         ▼                                        ▼       │
-│  ┌──────────────┐                    ┌──────────────────┐│
-│  │ Kentik API   │                    │ Chronicle UDM    ││
-│  │ (grpc.api.   │                    │ Ingestion API    ││
-│  │  kentik.com) │                    │ (secops SDK)     ││
-│  └──────────────┘                    └──────────────────┘│
-└──────────────────────────────────────────────────────────┘
+Kentik APIs                   Converters                  Chronicle
+────────────────────────────────────────────────────────────────────────
+Alerting API  ──▶  kentik_to_chronicle.py   ──▶  ingest_udm()
+                   (alert_to_udm)                NETWORK_CONNECTION
+                                                 GENERIC_EVENT
+
+BGP Monitoring ──▶  bgp_to_chronicle.py     ──▶  ingest_udm()
+API                 (metric_to_udm,              NETWORK_UNCATEGORIZED
+                     route_to_udm)
+
+Audit Log API ──▶  audit_to_chronicle.py    ──▶  ingest_udm()
+                   (audit_event_to_udm)          USER_RESOURCE_ACCESS
+
+Device &      ──▶  inventory_to_chronicle.py ──▶  import_entities()
+Interface API       (device_to_entity,            ASSET entities
+                     interface_to_entity)
 ```
+
+All scripts share the same credential model:
+- Kentik: `KENTIK_API_EMAIL` + `KENTIK_API_TOKEN` environment variables
+- Chronicle: Google ADC (`GOOGLE_APPLICATION_CREDENTIALS` or `gcloud auth application-default login`)
+- Chronicle instance: `CHRONICLE_CUSTOMER_ID`, `CHRONICLE_PROJECT_ID`, `CHRONICLE_REGION`
 
 ### State file
 
