@@ -1,0 +1,15 @@
+# Kentik API SDK (Python ≥ 3.10)
+# Install from the kentik-pyapi repository:
+#   pip install git+https://github.com/kentik/kentik-pyapi.git
+# or from a local clone:
+#   pip install -e /path/to/kentik-pyapi
+kentik-api>=0.1.0
+
+# Google Chronicle / SecOps Python SDK
+secops>=0.44.0
+
+# HTTP client used by kentik-api
+httpx>=0.27.0
+
+# Data validation (transitively required by kentik-api)
+pydantic>=2.6.0
